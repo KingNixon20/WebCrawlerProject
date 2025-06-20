@@ -1,5 +1,7 @@
 # 🧠 NerdCrawler
-![Static Badge](https://img.shields.io/badge/Beta-V1.1-green?logoColor=%23FFFFFF&labelColor=%23000000&color=%233cdb00&link=https%3A%2F%2Fkuma.projectkryptos.xyz%2Fstatus%2Fprojectkryptos)
+![Static Badge](https://img.shields.io/badge/Beta-V1.1-green?logoColor=%23FFFFFF&labelColor=%23000000&color=%233cdb00&link=https%3A%2F%2Fkuma.projectkryptos.xyz%2Fstatus%2Fprojectkryptos) ![Website](https://img.shields.io/website?url=https%3A%2F%2Fap.projectkryptos.xyz%2F)
+
+
 ![alt text](image.png)
 **NerdCrawler** is a fully self-hosted search engine built entirely from scratch — including both the frontend and backend. No external APIs, no third-party engines — just raw crawling power.
 
