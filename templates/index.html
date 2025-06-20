@@ -1,0 +1,297 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <title>Web Crawler Search</title>
+  <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}?v=1.16" />
+  <script>
+    function toggleSettingsMenu() {
+      document.getElementById("settings-dropdown").classList.toggle("visible");
+    }
+    function openThemePopup() {
+      document.getElementById("theme-popup-overlay").classList.add("visible");
+    }
+    function closeThemePopup() {
+      document.getElementById("theme-popup-overlay").classList.remove("visible");
+    }
+    function chooseBuiltInBG(name) {
+      document.documentElement.style.setProperty(
+        "--bg-image-url",
+        `url('/static/${name}')`
+      );
+      const expires = new Date();
+      expires.setFullYear(expires.getFullYear() + 1);
+      document.cookie = `bg=${name}; path=/; expires=${expires.toUTCString()}`;
+    }
+    function previewUploadedBG(input) {
+      if (input.files && input.files[0]) {
+        const reader = new FileReader();
+        reader.onload = e => {
+          document.documentElement.style.setProperty(
+            "--bg-image-url",
+            `url('${e.target.result}')`
+          );
+        };
+        reader.readAsDataURL(input.files[0]);
+      }
+    }
+    function changeBlur(value) {
+      document.documentElement.style.setProperty("--bg-blur", value + "px");
+      const expires = new Date();
+      expires.setFullYear(expires.getFullYear() + 1);
+      document.cookie = `blur=${value}px; path=/; expires=${expires.toUTCString()}`;
+    }
+    function toggleViewMode(mode) {
+      const container = document.getElementById('results-container');
+      
+      if (mode === 'list') {
+        container.classList.remove('grid-view');
+        container.classList.add('list-view');
+        document.getElementById('grid-view-toggle').checked = false;
+        document.getElementById('list-view-toggle').checked = true;
+      } 
+      else if (mode === 'grid') {
+        container.classList.remove('list-view');
+        container.classList.add('grid-view');
+        document.getElementById('list-view-toggle').checked = false;
+        document.getElementById('grid-view-toggle').checked = true;
+      }
+      else {
+        container.classList.toggle(mode + '-view');
+      }
+      
+      // Save to cookie
+      const expires = new Date();
+      expires.setFullYear(expires.getFullYear() + 1);
+      const isActive = container.classList.contains(mode + '-view');
+      document.cookie = `${mode}View=${isActive}; path=/; expires=${expires.toUTCString()}`;
+    }
+    function getCookie(name) {
+      const value = `; ${document.cookie}`;
+      const parts = value.split(`; ${name}=`);
+      if (parts.length === 2) return parts.pop().split(';').shift();
+    }
+    window.addEventListener("DOMContentLoaded", () => {
+      const bgPref = "{{ bg_pref or 'bg2.jpg' }}";
+      document.documentElement.style.setProperty(
+        "--bg-image-url",
+        `url('/static/${bgPref}')`
+      );
+      const blurVal = "{{ blur_pref }}";
+      document.documentElement.style.setProperty("--bg-blur", blurVal);
+      const blurSlider = document.getElementById("blur-slider");
+      if (blurSlider) {
+        blurSlider.value = parseInt(blurVal);
+        document.getElementById("blur-value").innerText = blurVal;
+      }
+      
+      // Load view mode preferences
+      const container = document.getElementById('results-container');
+      if (container) {
+        // List/Grid view - default to list view
+        const listView = getCookie('listView') !== 'false';
+        const gridView = getCookie('gridView') === 'true';
+        
+        if (gridView) {
+          container.classList.add('grid-view');
+          container.classList.remove('list-view');
+          document.getElementById('grid-view-toggle').checked = true;
+          document.getElementById('list-view-toggle').checked = false;
+        } else {
+          container.classList.add('list-view');
+          container.classList.remove('grid-view');
+          document.getElementById('list-view-toggle').checked = true;
+          document.getElementById('grid-view-toggle').checked = false;
+        }
+        
+        // Simple/Advanced view
+        const simpleView = getCookie('simpleView') === 'true';
+        const advancedView = getCookie('advancedView') === 'true';
+        
+        if (simpleView) {
+          container.classList.add('simple-view');
+          document.getElementById('simple-toggle').checked = true;
+        }
+        if (advancedView) {
+          container.classList.add('advanced-view');
+          document.getElementById('advanced-toggle').checked = true;
+        }
+      }
+    });
+  </script>
+</head>
+
+<body class="{% if results %}results-active{% endif %}">
+  <!-- Top Bar -->
+  <div id="top-bar">
+    <div id="top-bar-title"></div>
+    <div id="settings-container">
+      <button id="settings-icon" onclick="toggleSettingsMenu()">
+        <img src="{{ url_for('static', filename='settings.png') }}" alt="Settings" />
+      </button>
+      <ul id="settings-dropdown">
+        <li onclick="openThemePopup()">Theme</li>
+        <li>Settings</li>
+        <li><a href="/login">Login</a></li>
+      </ul>
+    </div>
+  </div>
+  
+  <!-- Main Content -->
+  <div id="main-content">
+    <a href="{{ url_for('index') }}" id="nerdcrawler-link">
+      <!-- Homepage: Full text -->
+      <span class="full-text">
+        <span class="nerd">Nerd</span><span class="crawler">Crawler</span>
+      </span>
+      <!-- Results Page: Short text -->
+      <span class="short-text">NC</span>
+    </a>
+    <!-- Logo Text - Using CSS content switching -->
+    <a href="{{ url_for('index') }}" id="logo-link">
+      <h1 id="logo-text"></h1>
+    </a>
+
+    <!-- Search Form -->
+    <div id="search-container">
+      <form method="post" action="{{ url_for('index') }}">
+        <div class="search-bar-wrapper">
+          <input
+            type="text"
+            name="search"
+            id="search-input"
+            placeholder="Type to search..."
+            value="{{ searched }}"
+            autocomplete="off"
+          />
+          <button type="submit" id="search-button">
+            <img src="{{ url_for('static', filename='search.png') }}" alt="Search" />
+          </button>
+        </div>
+      </form>
+    </div>
+
+    <!-- Results -->
+    {% if results %}
+      <div id="results-info">
+        Showing page {{ page }} of {{ total_pages }} ({{ total }} results)
+      </div>
+      
+      <!-- View Mode Toggles -->
+      <div class="view-mode-options">
+        <div class="view-mode-toggle">
+          <input type="checkbox" id="list-view-toggle" onchange="toggleViewMode('list')" checked>
+          <label for="list-view-toggle">List View</label>
+        </div>
+        <div class="view-mode-toggle grid-view-option">
+          <input type="checkbox" id="grid-view-toggle" onchange="toggleViewMode('grid')">
+          <label for="grid-view-toggle">Grid View</label>
+        </div>
+        <div class="view-mode-toggle">
+          <input type="checkbox" id="simple-toggle" onchange="toggleViewMode('simple')">
+          <label for="simple-toggle">Simple View</label>
+        </div>
+        <div class="view-mode-toggle">
+          <input type="checkbox" id="advanced-toggle" onchange="toggleViewMode('advanced')">
+          <label for="advanced-toggle">Advanced View</label>
+        </div>
+        
+        <!-- Results per page dropdown -->
+        <div class="results-per-page">
+          <form method="post" id="per-page-form">
+            <input type="hidden" name="search" value="{{ searched }}" />
+            <select name="per_page" onchange="document.getElementById('per-page-form').submit()">
+              <option value="25" {% if per_page == 25 %}selected{% endif %}>25 per page</option>
+              <option value="50" {% if per_page == 50 %}selected{% endif %}>50 per page</option>
+              <option value="100" {% if per_page == 100 %}selected{% endif %}>100 per page</option>
+              <option value="200" {% if per_page == 200 %}selected{% endif %}>200 per page</option>
+            </select>
+          </form>
+        </div>
+      </div>
+      
+      <div id="results-container" class="list-view">
+        {% for row in results %}
+          {% set link = row.url if row.url.startswith('http') else 'http://' ~ row.url %}
+          <div class="result-card">
+            <a href="{{ link }}" target="_blank" class="result-title">{{ row.title }}</a>
+            <p class="result-summary">{{ row.summary }}</p>
+            <div class="result-meta">
+              <span class="result-time">{{ row.timestamp }}</span>
+              <span class="result-tags">{{ row.tags }}</span>
+            </div>
+          </div>
+        {% endfor %}
+      </div>
+
+      {% if total_pages > 1 %}
+        <div id="pagination">
+          {% if page > 1 %}
+            <form method="post" style="display:inline;">
+              <input type="hidden" name="search" value="{{ searched }}" />
+              <input type="hidden" name="page" value="{{ page - 1 }}" />
+              <input type="hidden" name="per_page" value="{{ per_page }}" />
+              <button type="submit" class="page-btn">&laquo; Prev</button>
+            </form>
+          {% endif %}
+          {% if page < total_pages %}
+            <form method="post" style="display:inline;">
+              <input type="hidden" name="search" value="{{ searched }}" />
+              <input type="hidden" name="page" value="{{ page + 1 }}" />
+              <input type="hidden" name="per_page" value="{{ per_page }}" />
+              <button type="submit" class="page-btn">Next &raquo;</button>
+            </form>
+          {% endif %}
+        </div>
+      {% endif %}
+    {% endif %}
+  </div>
+
+  <!-- Theme Popup Overlay -->
+  <div id="theme-popup-overlay">
+    <div id="theme-popup">
+      <div id="theme-popup-header">
+        <h2>Choose Theme</h2>
+        <button onclick="closeThemePopup()">✖</button>
+      </div>
+      <div id="theme-popup-body">
+        <fieldset>
+          <legend>Background Images</legend>
+          <button onclick="chooseBuiltInBG('bg1.jpg')">Use bg1.jpg</button>
+          <button onclick="chooseBuiltInBG('bg2.jpg')">Use bg2.jpg</button>
+          <button onclick="chooseBuiltInBG('bg4.jpg')">Use bg4.jpg</button>
+          <button onclick="chooseBuiltInBG('bg5.jpg')">Use bg5.jpg</button>
+        </fieldset>
+        <fieldset>
+          <legend>Upload Your Own Image</legend>
+          <form method="post" action="{{ url_for('upload_bg') }}" enctype="multipart/form-data">
+            <input
+              type="file"
+              name="bg_file"
+              accept="image/*"
+              onchange="previewUploadedBG(this)"
+              required
+            />
+            <button type="submit">Upload &amp; Save</button>
+          </form>
+        </fieldset>
+        <fieldset>
+          <legend>Background Blur: <span id="blur-value">10px</span></legend>
+          <input
+            type="range"
+            id="blur-slider"
+            min="0"
+            max="30"
+            step="1"
+            value="10"
+            onchange="
+              changeBlur(this.value);
+              document.getElementById('blur-value').innerText = this.value + 'px';
+            "
+          />
+        </fieldset>
+      </div>
+    </div>
+  </div>
+</body>
+</html>

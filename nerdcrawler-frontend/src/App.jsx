@@ -7,6 +7,7 @@ import LoginPage from "./LoginPage"
 import DashboardPage from "./DashboardPage"
 import GamesPage from "./GamesPage"
 import AnalyticsPage from "./AnalyticsPage"
+import DownloadsPage from "./downloads"
 
 function AppContent() {
   const [currentRoute, setCurrentRoute] = useState("")
@@ -67,6 +68,8 @@ function AppContent() {
         return <GamesPage />
       case "/analytics":
         return <AnalyticsPage />
+      case "/downloads":
+        return <DownloadsPage />
       case "/":
       default:
         return <HomePage />

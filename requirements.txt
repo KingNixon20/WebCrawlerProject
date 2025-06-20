@@ -2,3 +2,10 @@ requests
 beautifulsoup4
 lxml
 simhash
+supervisor
+flask-cors 
+psycopg2-binary 
+pyjwt
+nltk
+psutil
+tkinter

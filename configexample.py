@@ -13,7 +13,6 @@ DB_PASS = os.getenv("DB_PASS", "PASSWORD_HERE")
 # How many tags to generate per page
 MIN_TAGS = int(os.getenv("MIN_TAGS", "40"))
 MAX_TAGS = int(os.getenv("MAX_TAGS", "100"))
-import os
 
 # Database configuration
 DB_HOST = os.environ.get('DB_HOST', 'localhost')

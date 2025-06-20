@@ -629,6 +629,27 @@ export default function HomePage() {
                   >
                     🎮 Games
                   </button>
+                  <button
+                    onMouseDown={(e) => {
+                      e.stopPropagation()
+                      e.preventDefault()
+                      window.history.pushState({}, "", "/downloads")
+                      window.dispatchEvent(new PopStateEvent("popstate"))
+                    }}
+                    style={{
+                      width: "100%",
+                      padding: "12px 16px",
+                      background: "none",
+                      border: "none",
+                      color: "#fff",
+                      fontSize: "14px",
+                      textAlign: "left",
+                      cursor: "pointer",
+                      borderBottom: "1px solid rgba(255, 255, 255, 0.05)",
+                    }}
+                  >
+                    📥 Downloads
+                  </button>
                   {isAuthenticated ? (
                     <>
                       <div
@@ -816,6 +837,27 @@ export default function HomePage() {
                       }}
                     >
                       🎮 Games
+                    </button>
+                    <button
+                      onMouseDown={(e) => {
+                        e.stopPropagation()
+                        e.preventDefault()
+                        window.history.pushState({}, "", "/downloads")
+                        window.dispatchEvent(new PopStateEvent("popstate"))
+                      }}
+                      style={{
+                        width: "100%",
+                        padding: "12px 16px",
+                        background: "none",
+                        border: "none",
+                        color: "#fff",
+                        fontSize: "14px",
+                        textAlign: "left",
+                        cursor: "pointer",
+                        borderBottom: "1px solid rgba(255, 255, 255, 0.05)",
+                      }}
+                    >
+                      📥 Downloads
                     </button>
                     {isAuthenticated ? (
                       <>

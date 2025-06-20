@@ -1,163 +1,173 @@
-import sqlite3
-import os
-from datetime import datetime
-import time
+#!/usr/bin/env python3
+"""
+database.py
+
+PostgreSQL database utilities for the DarkNetCrawler.
+Handles schema setup, page saving, and deduplication.
+"""
+
+import logging
+import psycopg2
+from psycopg2.pool import ThreadedConnectionPool
 from simhash import Simhash
 from urllib.parse import urlparse
+from config import DB_HOST, DB_PORT, DB_NAME, DB_USER, DB_PASS
 
-# ── Path to your DB file (now named database.db) ───────────────────────────────
-DB_PATH = os.path.abspath(os.path.join(os.getcwd(), "database.db"))
+# Logger setup
+logging.basicConfig(filename='crawler.log', level=logging.INFO,
+                    format='%(asctime)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
 
+# Connection pool
+db_pool = ThreadedConnectionPool(1, 5, host=DB_HOST, port=DB_PORT,
+                                 dbname=DB_NAME, user=DB_USER, password=DB_PASS)
 
-def get_connection(timeout_ms: int = 5000):
+def get_connection():
+    """Return a connection from the pool."""
+    return db_pool.getconn()
+
+def release_connection(conn):
+    """Return a connection to the pool."""
+    db_pool.putconn(conn)
+
+def close_pool():
+    """Close all connections in the pool."""
+    db_pool.closeall()
+
+def normalize_url_path(url):
+    """Normalize URL path for deduplication."""
+    parsed = urlparse(url)
+    return parsed.path.rstrip('/')
+
+def save_page(conn, title: str, url: str, summary: str, tags: list, images: list):
     """
-    Returns a new SQLite connection to DB_PATH (database.db), with:
-      - PRAGMA journal_mode=WAL
-      - PRAGMA synchronous=FULL
-      - PRAGMA busy_timeout = timeout_ms
+    Inserts a page into webpages, tags, and images tables, skipping duplicates
+    based on Simhash and URL path.
     """
-    conn = sqlite3.connect(DB_PATH, timeout=timeout_ms / 1000.0)
-    conn.execute("PRAGMA journal_mode=WAL;")
-    conn.execute("PRAGMA synchronous=FULL;")
-    conn.execute(f"PRAGMA busy_timeout = {timeout_ms};")
-    return conn
+    content_hash = str(Simhash(summary))
+    cur = conn.cursor()
+    try:
+        # Check for duplicates
+        cur.execute("SELECT url, content_hash FROM webpages WHERE content_hash IS NOT NULL;")
+        for existing_url, existing_hash in cur.fetchall():
+            if existing_hash and normalize_url_path(existing_url) == normalize_url_path(url):
+                distance = Simhash(existing_hash).distance(Simhash(content_hash))
+                if distance <= 3:
+                    logger.info(f"Skipped duplicate page: {url} (hash distance {distance})")
+                    return
 
+        # Insert page
+        cur.execute(
+            """
+            INSERT INTO webpages (title, url, summary, content_hash, timestamp)
+            VALUES (%s, %s, %s, %s, NOW())
+            ON CONFLICT (url) DO NOTHING
+            RETURNING url;
+            """,
+            (title, url, summary, content_hash)
+        )
+        if cur.fetchone():  # Insert succeeded
+            logger.info(f"Stored page: {url} ({title})")
+        else:
+            logger.info(f"Skipped page due to URL conflict: {url}")
 
-def save_page(conn, title: str, url: str, summary: str, tags: str, images: str):
-    """
-    Inserts a page into the `webpages` table, skipping duplicates based on simhash
-    """
-    timestamp = datetime.utcnow().isoformat() + 'Z'
-    content_hash = Simhash(summary)
-    # Skip duplicate pages with same path and similar content
-    def normalize_url_path(u):
-        parsed = urlparse(u)
-        return parsed.path.rstrip('/')
-
-    # Check existing pages
-    retries = 3
-    delay = 0.1
-    for _ in range(retries):
-        try:
-            c = conn.cursor()
-            c.execute("SELECT url, content_hash FROM webpages")
-            for existing_url, existing_hash in c.fetchall():
-                if existing_hash:
-                    distance = Simhash(existing_hash).distance(content_hash)
-                    if normalize_url_path(existing_url) == normalize_url_path(url) and distance <= 3:
-                        return
-            break
-        except sqlite3.OperationalError as e:
-            if "database is locked" in str(e).lower():
-                time.sleep(delay)
-            else:
-                raise
-    # Insert new page
-    c = conn.cursor()
-    c.execute(
-        """
-        INSERT INTO webpages(
-            title, url, summary, timestamp, tags, content_hash, images
-        ) VALUES (?, ?, ?, ?, ?, ?, ?)
-        """,
-        (title, url, summary, timestamp, tags, str(content_hash), images)
-    )
-    conn.commit()
-
+        # Insert tags
+        for tag in tags:
+            cur.execute(
+                """
+                INSERT INTO tags (url, tag) VALUES (%s, %s)
+                ON CONFLICT DO NOTHING;
+                """,
+                (url, tag)
+            )
+        # Insert images
+        for image in images:
+            cur.execute(
+                """
+                INSERT INTO images (url, image_url) VALUES (%s, %s)
+                ON CONFLICT DO NOTHING;
+                """,
+                (url, image)
+            )
+        conn.commit()
+    except Exception as e:
+        logger.error(f"Error saving page {url}: {e}")
+        conn.rollback()
+    finally:
+        cur.close()
 
 def page_exists(conn, url: str) -> bool:
-    """
-    Returns True if the given URL has already been crawled.
-    """
-    c = conn.cursor()
-    c.execute("SELECT 1 FROM crawled_urls WHERE url = ?;", (url,))
-    return c.fetchone() is not None
-
+    """Returns True if the URL is in crawled_urls."""
+    cur = conn.cursor()
+    try:
+        cur.execute("SELECT 1 FROM crawled_urls WHERE url = %s;", (url,))
+        return cur.fetchone() is not None
+    finally:
+        cur.close()
 
 def setup_schema():
-    """
-    Creates necessary tables if they don't already exist:
-      - webpages: stores content of each page
-      - webpages_fts: FTS5 virtual table for full-text search
-      - triggers to keep webpages_fts in sync
-      - crawled_urls: stores every URL we've processed
-      - pending_urls: URLs awaiting crawl
-      - Language: stores detected language per URL
-    """
+    """Creates and migrates PostgreSQL tables for the crawler."""
     conn = get_connection()
-    c = conn.cursor()
-
-    # 1) Create the main 'webpages' table
-    c.execute("""
-    CREATE TABLE IF NOT EXISTS webpages (
-        id            INTEGER PRIMARY KEY AUTOINCREMENT,
-        title         TEXT,
-        url           TEXT UNIQUE,
-        summary       TEXT,
-        timestamp     TEXT,
-        tags          TEXT,
-        content_hash  TEXT,
-        images        TEXT
-    );
-    """
-    )
-
-    # 2) Create FTS virtual table
-    c.execute("""
-    CREATE VIRTUAL TABLE IF NOT EXISTS webpages_fts USING fts5(
-        title, summary, tags, content='webpages', content_rowid='id'
-    );
-    """
-    )
-    # Triggers to keep FTS in sync
-    c.execute("""
-    CREATE TRIGGER IF NOT EXISTS webpages_ai AFTER INSERT ON webpages BEGIN
-      INSERT INTO webpages_fts(rowid, title, summary, tags)
-      VALUES (new.id, new.title, new.summary, new.tags);
-    END;
-    """
-    )
-    c.execute("""
-    CREATE TRIGGER IF NOT EXISTS webpages_ad AFTER DELETE ON webpages BEGIN
-      INSERT INTO webpages_fts(webpages_fts, rowid, title, summary, tags)
-      VALUES('delete', old.id, old.title, old.summary, old.tags);
-    END;
-    """
-    )
-    c.execute("""
-    CREATE TRIGGER IF NOT EXISTS webpages_au AFTER UPDATE ON webpages BEGIN
-      INSERT INTO webpages_fts(webpages_fts, rowid, title, summary, tags)
-      VALUES('delete', old.id, old.title, old.summary, old.tags);
-      INSERT INTO webpages_fts(rowid, title, summary, tags)
-      VALUES (new.id, new.title, new.summary, new.tags);
-    END;
-    """
-    )
-
-    # 3) Create 'crawled_urls' table
-    c.execute("""
-    CREATE TABLE IF NOT EXISTS crawled_urls (
-        url TEXT PRIMARY KEY
-    );
-    """
-    )
-
-    # 4) Create 'pending_urls' table
-    c.execute("""
-    CREATE TABLE IF NOT EXISTS pending_urls (
-        url TEXT PRIMARY KEY
-    );
-    """
-    )
-
-    # 5) Create table to store page-language mapping
-    c.execute("""
-    CREATE TABLE IF NOT EXISTS Language (
-        url      TEXT PRIMARY KEY,
-        language TEXT
-    );
-    """
-    )
-
-    conn.commit()
-    conn.close()
+    try:
+        cur = conn.cursor()
+        # Create tables
+        cur.execute("CREATE TABLE IF NOT EXISTS crawled_urls(url TEXT PRIMARY KEY);")
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS pending_urls(
+                url TEXT PRIMARY KEY,
+                depth INTEGER DEFAULT 0
+            );
+        """)
+        # Migrate pending_urls to add depth if missing
+        cur.execute("""
+            SELECT column_name
+            FROM information_schema.columns
+            WHERE table_name = 'pending_urls' AND column_name = 'depth';
+        """)
+        if not cur.fetchone():
+            logger.info("Adding depth column to pending_urls")
+            cur.execute("ALTER TABLE pending_urls ADD COLUMN depth INTEGER DEFAULT 0;")
+            cur.execute("UPDATE pending_urls SET depth = 0 WHERE depth IS NULL;")
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS webpages(
+                title TEXT,
+                url TEXT PRIMARY KEY,
+                summary TEXT,
+                content_hash TEXT,
+                timestamp TIMESTAMP DEFAULT NOW(),
+                tsv TSVECTOR GENERATED ALWAYS AS (
+                    to_tsvector('english', coalesce(title, '') || ' ' || coalesce(summary, ''))
+                ) STORED
+            );
+        """)
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS tags(
+                url TEXT REFERENCES webpages(url),
+                tag TEXT,
+                PRIMARY KEY (url, tag)
+            );
+        """)
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS images(
+                url TEXT REFERENCES webpages(url),
+                image_url TEXT,
+                PRIMARY KEY (url, image_url)
+            );
+        """)
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS language(
+                url TEXT PRIMARY KEY,
+                language TEXT
+            );
+        """)
+        cur.execute("CREATE TABLE IF NOT EXISTS blocked_domains(domain TEXT PRIMARY KEY);")
+        # Indexes
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_webpages_timestamp ON webpages(timestamp);")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_webpages_tsv ON webpages USING GIN(tsv);")
+        conn.commit()
+    except Exception as e:
+        logger.error(f"Schema creation/migration error: {e}")
+        conn.rollback()
+    finally:
+        cur.close()
+        release_connection(conn)
