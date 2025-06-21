@@ -6,7 +6,7 @@
 **NerdCrawler** is a fully self-hosted search engine built entirely from scratch — including both the frontend and backend. No external APIs, no third-party engines — just raw crawling power.
 
 Visit the live demo: [https://ap.projectkryptos.xyz](https://ap.projectkryptos.xyz)
-Uptime: [text](https://kuma.projectkryptos.xyz/status/projectkryptos)
+Uptime: [Kuma Uptime Monitor](https://kuma.projectkryptos.xyz/status/projectkryptos)
 ---
 
 ## 🚀 Features

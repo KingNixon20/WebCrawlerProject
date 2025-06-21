@@ -17,6 +17,7 @@ import urllib3
 from urllib.robotparser import RobotFileParser
 import multiprocessing
 import psutil
+from crawler_config import API_BASE_URL
 
 # Check NLTK resources
 try:
@@ -49,17 +50,6 @@ STOP_WORDS = set(stopwords.words('english'))
 MAX_THREADS = multiprocessing.cpu_count()
 logger.info(f"Detected {MAX_THREADS} CPU cores; maximum thread count set to {MAX_THREADS}")
 
-# Crawler server API configuration
-API_BASE_URL = 'https://crawler.projectkryptos.xyz/api/crawler'
-FETCH_URLS_ENDPOINT = f'{API_BASE_URL}/urls'
-SUBMIT_DATA_ENDPOINT = f'{API_BASE_URL}/submit'
-RESET_ENDPOINT = f'{API_BASE_URL}/reset'
-
-# Request headers
-HEADERS = {
-    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
-}
-
 # Shared queue for GUI communication
 log_queue = queue.Queue()
 
@@ -73,6 +63,11 @@ retries = Retry(
 adapter = HTTPAdapter(max_retries=retries)
 session.mount('http://', adapter)
 session.mount('https://', adapter)
+
+# Request headers
+HEADERS = {
+    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
+}
 
 # Rate limit tracking
 domain_delays = {}
@@ -107,6 +102,27 @@ def can_crawl(url):
         logger.warning(f"Error checking robots.txt for {url}: {e}")
         log_queue.put(f"Error checking robots.txt for {url}: {e}")
         return True
+
+def is_domain_blacklisted(domain, blacklist_check_endpoint, jwt_token):
+    """Check if domain is blacklisted by making an API call."""
+    try:
+        headers = HEADERS.copy()
+        if jwt_token:
+            headers['Authorization'] = f'Bearer {jwt_token}'
+        response = session.get(blacklist_check_endpoint, params={'domain': domain}, headers=headers, timeout=5)
+        response.raise_for_status()
+        is_blacklisted = response.json().get('blacklisted', False)
+        logger.info(f"Domain {domain} is {'blacklisted' if is_blacklisted else 'not blacklisted'}")
+        log_queue.put(f"Domain {domain} is {'blacklisted' if is_blacklisted else 'not blacklisted'}")
+        return is_blacklisted
+    except requests.exceptions.HTTPError as e:
+        logger.error(f"HTTP error checking blacklist for {domain}: {e.response.status_code} - {e.response.text}")
+        log_queue.put(f"HTTP error checking blacklist for {domain}: {e.response.status_code}")
+        return True  # Assume blacklisted on error
+    except Exception as e:
+        logger.error(f"Error checking blacklist for {domain}: {e}")
+        log_queue.put(f"Error checking blacklist for {domain}: {e}")
+        return True  # Assume blacklisted on error
 
 def respect_rate_limit(url):
     """Enforce crawl delay for the domain."""
@@ -174,21 +190,27 @@ def generate_tags(soup, max_tags=40, min_tags=20):
         logger.warning(f"Failed to generate {min_tags} tags; only {len(selected_tags)} generated")
     return ','.join(selected_tags[:max_tags])
 
-def extract_urls(soup, base_url):
-    """Extract URLs from the page."""
+def extract_urls(soup, base_url, blacklist_check_endpoint, jwt_token):
+    """Extract URLs from the page, filtering out blacklisted domains."""
     urls = set()
     for link in soup.find_all('a', href=True):
         href = link['href']
         absolute_url = urljoin(base_url, href)
         parsed = urlparse(absolute_url)
-        if parsed.scheme in ['http', 'https']:
+        if parsed.scheme in ['http', 'https'] and not is_domain_blacklisted(parsed.netloc, blacklist_check_endpoint, jwt_token):
             urls.add(absolute_url)
     return list(urls)
 
-def crawl_url(url):
+def crawl_url(url, blacklist_check_endpoint, jwt_token):
     """Crawl a single URL and extract data."""
     start_time = time.time()
     logger.info(f"Starting crawl for {url}")
+    domain = urlparse(url).netloc
+    if domain == 'wikihow.com' or is_domain_blacklisted(domain, blacklist_check_endpoint, jwt_token):
+        logger.warning(f"Skipping {url} as domain {domain} is blacklisted")
+        log_queue.put(f"Skipping {url} as domain {domain} is blacklisted")
+        return None
+    
     if not can_crawl(url):
         logger.warning(f"URL {url} disallowed by robots.txt")
         log_queue.put(f"URL {url} disallowed by robots.txt")
@@ -213,7 +235,7 @@ def crawl_url(url):
         tag_count = len(tags.split(',')) if tags else 0
         if tag_count < 20:
             logger.warning(f"URL {url} generated only {tag_count} tags, expected at least 20")
-        new_urls = extract_urls(soup, url)
+        new_urls = extract_urls(soup, url, blacklist_check_endpoint, jwt_token)
         logger.info(f"Completed crawl for {url}: {tag_count} tags, {len(new_urls)} new URLs in {time.time() - start_time:.2f}s")
         return {
             'url': url,
@@ -242,7 +264,7 @@ def crawl_url(url):
             tag_count = len(tags.split(',')) if tags else 0
             if tag_count < 20:
                 logger.warning(f"URL {url} generated only {tag_count} tags in fallback, expected at least 20")
-            new_urls = extract_urls(soup, url)
+            new_urls = extract_urls(soup, url, blacklist_check_endpoint, jwt_token)
             logger.info(f"Completed fallback crawl for {url}: {tag_count} tags, {len(new_urls)} new URLs in {time.time() - start_time:.2f}s")
             return {
                 'url': url,
@@ -264,13 +286,16 @@ def crawl_url(url):
         log_queue.put(f"Unexpected error crawling {url}: {e}")
         return None
 
-def fetch_urls(max_retries=3):
+def fetch_urls(fetch_urls_endpoint, jwt_token, max_retries=3):
     """Fetch URLs to crawl from the server."""
     start_time = time.time()
+    headers = HEADERS.copy()
+    if jwt_token:
+        headers['Authorization'] = f'Bearer {jwt_token}'
     for attempt in range(max_retries):
         try:
             logger.info(f"Fetching URLs (attempt {attempt+1}/{max_retries})")
-            response = session.get(FETCH_URLS_ENDPOINT, timeout=10, verify=True)
+            response = session.get(fetch_urls_endpoint, headers=headers, timeout=10, verify=True)
             response.raise_for_status()
             data = response.json()
             urls = data.get('urls', [])
@@ -278,7 +303,8 @@ def fetch_urls(max_retries=3):
             if not urls and attempt == max_retries - 1:
                 logger.warning("No URLs available after retries; requesting reset")
                 try:
-                    session.post(RESET_ENDPOINT, timeout=10)
+                    response = session.post(f'{fetch_urls_endpoint}/reset', headers=headers, timeout=10)
+                    response.raise_for_status()
                     logger.info("Requested crawler reset")
                 except Exception as e:
                     logger.error(f"Failed to request reset: {e}")
@@ -287,7 +313,7 @@ def fetch_urls(max_retries=3):
             logger.warning(f"SSL/TLS error fetching URLs: {e}")
             log_queue.put(f"SSL/TLS error fetching URLs: {e}")
             try:
-                response = session.get(FETCH_URLS_ENDPOINT, timeout=10, verify=False)
+                response = session.get(fetch_urls_endpoint, headers=headers, timeout=10, verify=False)
                 response.raise_for_status()
                 data = response.json()
                 urls = data.get('urls', [])
@@ -296,19 +322,28 @@ def fetch_urls(max_retries=3):
             except Exception as e:
                 logger.error(f"Fallback fetch failed: {e}")
                 log_queue.put(f"Fallback fetch failed: {e}")
-        except requests.exceptions.RequestException as e:
-            logger.error(f"Error fetching URLs: {e}")
-            log_queue.put(f"Error fetching URLs: {e}")
+        except requests.exceptions.HTTPError as e:
+            logger.error(f"Error fetching URLs: {e.response.status_code} Client Error: {e.response.reason} for url: {e.request.url}")
+            log_queue.put(f"Error fetching URLs: {e.response.status_code} Client Error: {e.response.reason} for url: {e.request.url}")
+            if e.response.status_code == 401:
+                logger.error("Authentication failed; check JWT token")
+                log_queue.put("Authentication failed; check JWT token")
+                time.sleep(10)  # Back off on auth errors
+            else:
+                time.sleep(2 ** attempt)
         except Exception as e:
             logger.error(f"Unexpected error fetching URLs: {e}")
             log_queue.put(f"Unexpected error fetching URLs: {e}")
-        time.sleep(2 ** attempt)
+            time.sleep(2 ** attempt)
     logger.error(f"Failed to fetch URLs after retries in {time.time() - start_time:.2f}s")
     return []
 
-def submit_crawl_data(data, max_retries=3):
+def submit_crawl_data(data, submit_data_endpoint, jwt_token, max_retries=3):
     """Submit crawled data to the server."""
     start_time = time.time()
+    headers = HEADERS.copy()
+    if jwt_token:
+        headers['Authorization'] = f'Bearer {jwt_token}'
     for attempt in range(max_retries):
         try:
             logger.info(f"Submitting data for {data['url']} (attempt {attempt+1}/{max_retries})")
@@ -317,7 +352,7 @@ def submit_crawl_data(data, max_retries=3):
                 logger.error(f"Data for {data['url']} has only {tag_count} tags; not submitting")
                 log_queue.put(f"Data for {data['url']} has only {tag_count} tags; not submitting")
                 return False
-            response = session.post(SUBMIT_DATA_ENDPOINT, json=data, timeout=10, verify=True)
+            response = session.post(submit_data_endpoint, json=data, headers=headers, timeout=10, verify=True)
             response.raise_for_status()
             logger.info(f"Submitted data for {data['url']} in {time.time() - start_time:.2f}s: {response.json().get('message')}")
             log_queue.put(f"Submitted data for {data['url']}")
@@ -326,7 +361,7 @@ def submit_crawl_data(data, max_retries=3):
             logger.warning(f"SSL/TLS error submitting data for {data['url']}: {e}")
             log_queue.put(f"SSL/TLS error submitting data for {data['url']}: {e}")
             try:
-                response = session.post(SUBMIT_DATA_ENDPOINT, json=data, timeout=10, verify=False)
+                response = session.post(submit_data_endpoint, json=data, headers=headers, timeout=10, verify=False)
                 response.raise_for_status()
                 logger.info(f"Submitted data for {data['url']} in fallback in {time.time() - start_time:.2f}s")
                 log_queue.put(f"Submitted data for {data['url']} in fallback")
@@ -344,15 +379,23 @@ def submit_crawl_data(data, max_retries=3):
     logger.error(f"Failed to submit data for {data['url']} after retries in {time.time() - start_time:.2f}s")
     return False
 
-def worker_thread(stop_event):
+def worker_thread(stop_event, pause_event, api_base_url, jwt_token):
     """Worker thread function."""
+    FETCH_URLS_ENDPOINT = f'{api_base_url}/urls'
+    SUBMIT_DATA_ENDPOINT = f'{api_base_url}/submit'
+    BLACKLIST_CHECK_ENDPOINT = f'{api_base_url}/blacklist_domain'
+    logger.debug(f"Worker thread started with API base URL: {api_base_url}")
+
     process = psutil.Process()
     while not stop_event.is_set():
+        if pause_event.is_set():
+            time.sleep(1)
+            continue
         try:
             start_time = time.time()
             memory_mb = process.memory_info().rss / (1024 * 1024)
             logger.info(f"Worker memory usage: {memory_mb:.2f} MB")
-            urls = fetch_urls()
+            urls = fetch_urls(FETCH_URLS_ENDPOINT, jwt_token)
             if not urls:
                 logger.info(f"No URLs to crawl, waiting... (worker cycle: {time.time() - start_time:.2f}s)")
                 log_queue.put("No URLs to crawl, waiting...")
@@ -360,16 +403,16 @@ def worker_thread(stop_event):
                 continue
             
             for url in urls:
-                if stop_event.is_set():
+                if stop_event.is_set() or pause_event.is_set():
                     break
-                data = crawl_url(url)
+                data = crawl_url(url, BLACKLIST_CHECK_ENDPOINT, jwt_token)
                 if data:
-                    if submit_crawl_data(data):
+                    if submit_crawl_data(data, SUBMIT_DATA_ENDPOINT, jwt_token):
                         logger.info(f"Successfully processed {url} in {time.time() - start_time:.2f}s")
                     else:
                         logger.error(f"Failed to submit data for {url}")
                 else:
-                    logger.error(f"Failed to crawl {url}")
+                    logger.info(f"Skipped crawling {url} in {time.time() - start_time:.2f}s")
                 time.sleep(random.uniform(0.5, 2))
             
         except Exception as e:
@@ -377,22 +420,27 @@ def worker_thread(stop_event):
             log_queue.put(f"Worker error: {e}")
             time.sleep(5)
 
-def start_workers(num_threads, stop_event):
+def start_workers(num_threads, stop_event, pause_event, api_base_url=API_BASE_URL, jwt_token=None):
     """Start the specified number of worker threads."""
     num_threads = min(num_threads, MAX_THREADS)
-    logger.info(f"Starting {num_threads} crawler worker threads (capped at {MAX_THREADS})")
-    log_queue.put(f"Starting {num_threads} crawler worker threads (capped at {MAX_THREADS})")
+    logger.info(f"Starting {num_threads} crawler worker threads (capped at {MAX_THREADS}) with API: {api_base_url}")
+    log_queue.put(f"Starting {num_threads} crawler worker threads (capped at {MAX_THREADS}) with API: {api_base_url}")
     threads = []
     for i in range(num_threads):
-        thread = threading.Thread(target=worker_thread, args=(stop_event,), name=f"Worker-{i+1}")
-        thread.daemon = True
+        thread = threading.Thread(
+            target=worker_thread,
+            args=(stop_event, pause_event, api_base_url, jwt_token),
+            name=f"Worker-{i+1}",
+            daemon=True
+        )
         thread.start()
         threads.append(thread)
     return threads
 
 if __name__ == '__main__':
     stop_event = threading.Event()
-    threads = start_workers(4, stop_event)  # Fallback default
+    pause_event = threading.Event()
+    threads = start_workers(4, stop_event, pause_event)
     try:
         while True:
             time.sleep(1)

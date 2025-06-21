@@ -1,285 +1,237 @@
-import os
-import sys
-import psycopg2
-from psycopg2 import extras
-from psycopg2.pool import SimpleConnectionPool
 from flask import Flask, jsonify, request
-from flask_cors import CORS
-import jwt
-import datetime
 from functools import wraps
-import traceback
-import threading
-import time
+import jwt
 import logging
+from logging.handlers import RotatingFileHandler
+import psycopg2
+from psycopg2.extras import RealDictCursor
+from urllib.parse import urlparse
+import time
+import threading
+import queue
 from crawler_config import DB_HOST, DB_PORT, DB_NAME, DB_USER, DB_PASS, JWT_SECRET
+
+app = Flask(__name__)
 
 # Configure logging
 logging.basicConfig(
-    level=logging.INFO,
+    level=logging.DEBUG,
     format='%(asctime)s [%(levelname)s] [%(threadName)s] %(message)s',
     handlers=[
-        logging.StreamHandler(),
-        logging.FileHandler('crawler_server.log')
+        RotatingFileHandler('crawler_server.log', maxBytes=10*1024*1024, backupCount=5),
+        logging.StreamHandler()
     ]
 )
 logger = logging.getLogger(__name__)
 
-# Add parent directory to sys.path
-current_dir = os.path.dirname(__file__)
-parent_dir = os.path.abspath(os.path.join(current_dir, os.pardir))
-if parent_dir not in sys.path:
-    sys.path.insert(0, parent_dir)
+# Global state
+blacklisted_domains = set()
+db_pool = queue.Queue()
+dedupe_enabled = True
+dedupe_interval = 10 * 60  # 10 minutes in seconds
+last_dedupe_time = 0
+current_domain = None
 
-app = Flask(__name__)
-
-# CORS configuration
-CORS(app, 
-     origins=["https://ap.projectkryptos.xyz", "http://localhost:3000", "http://localhost:5173"],
-     methods=["GET", "POST", "OPTIONS"],
-     allow_headers=["Content-Type", "Authorization"],
-     supports_credentials=True)
-
-# JWT Configuration
-app.config['JWT_SECRET_KEY'] = JWT_SECRET
-app.config['JWT_ACCESS_TOKEN_EXPIRES'] = datetime.timedelta(days=7)
-
-# In-memory storage for blacklisted tokens
-blacklisted_tokens = set()
-
-# Database connection pool
-db_pool = SimpleConnectionPool(
-    minconn=1,
-    maxconn=10,
-    host=DB_HOST,
-    port=DB_PORT,
-    dbname=DB_NAME,
-    user=DB_USER,
-    password=DB_PASS,
-    connect_timeout=10
-)
-
-# Deduplication interval (10 minutes in seconds)
-DEDUPE_INTERVAL = 600
+def get_db_config():
+    """Return database configuration from crawler_config."""
+    return {
+        'dbname': DB_NAME,
+        'user': DB_USER,
+        'password': DB_PASS,
+        'host': DB_HOST,
+        'port': DB_PORT
+    }
 
 def get_pg_connection():
-    """Return a connection from the pool."""
+    """Get a PostgreSQL connection from the pool or create a new one."""
     try:
-        conn = db_pool.getconn()
+        conn = db_pool.get(block=False)
+        if conn.closed:
+            conn = psycopg2.connect(**get_db_config())
         return conn
-    except psycopg2.Error as e:
-        logger.error(f"Database connection error: {e}")
-        raise
+    except queue.Empty:
+        return psycopg2.connect(**get_db_config())
 
 def release_pg_connection(conn):
-    """Release connection back to pool."""
-    try:
-        db_pool.putconn(conn)
-    except Exception as e:
-        logger.error(f"Error releasing connection: {e}")
+    """Release a connection back to the pool."""
+    if not conn.closed:
+        db_pool.put(conn)
 
-def deduplicate_database():
-    """Remove duplicate URLs from webpages, keeping the latest row by timestamp."""
-    logger.info("Starting periodic deduplication")
-    conn = get_pg_connection()
-    if not conn:
-        logger.error("Skipping deduplication: no database connection")
-        return
-    
-    try:
-        with conn:
-            with conn.cursor() as cur:
-                cur.execute("""
-                    WITH duplicates AS (
-                        SELECT url, id, timestamp,
-                               ROW_NUMBER() OVER (PARTITION BY url ORDER BY timestamp DESC, id DESC) AS rn
-                        FROM webpages
-                    )
-                    DELETE FROM webpages WHERE id IN (
-                        SELECT id FROM duplicates WHERE rn > 1
-                    )
-                """)
-                deleted_count = cur.rowcount
-                logger.info(f"Deduplicated {deleted_count} rows from webpages")
-    except Exception as e:
-        logger.error(f"Deduplication error: {e}")
-    finally:
-        release_pg_connection(conn)
-    
-    threading.Timer(DEDUPE_INTERVAL, deduplicate_database).start()
-
-def init_crawler_tables():
-    """Initialize crawler tables."""
+def init_db():
+    """Initialize database tables."""
     conn = get_pg_connection()
     try:
         cur = conn.cursor()
-        cur.execute("""
-            CREATE TABLE IF NOT EXISTS webpages (
-                id SERIAL PRIMARY KEY,
-                url VARCHAR(500) UNIQUE NOT NULL,
-                title VARCHAR(255),
-                summary TEXT,
-                tags TEXT,
-                timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            )
-        """)
         cur.execute("""
             CREATE TABLE IF NOT EXISTS crawl_queue (
                 id SERIAL PRIMARY KEY,
-                url VARCHAR(500) UNIQUE NOT NULL,
-                added_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                status VARCHAR(20) DEFAULT 'pending',
+                url TEXT UNIQUE NOT NULL,
+                status TEXT DEFAULT 'pending',
                 last_crawled TIMESTAMP
             )
         """)
-        cur.execute("CREATE INDEX IF NOT EXISTS idx_crawl_queue_status ON crawl_queue(status)")
-        try:
-            with open('seeds.txt', 'r') as f:
-                seed_urls = [url.strip() for url in f.readlines() if url.strip()]
-            for url in seed_urls:
-                cur.execute("""
-                    INSERT INTO crawl_queue (url)
-                    VALUES (%s)
-                    ON CONFLICT (url) DO NOTHING
-                """, (url,))
-        except FileNotFoundError:
-            logger.warning("seeds.txt not found, skipping seed URL initialization")
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS webpages (
+                id SERIAL PRIMARY KEY,
+                url TEXT UNIQUE NOT NULL,
+                title TEXT,
+                summary TEXT,
+                tags TEXT,
+                domain TEXT,
+                timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
         conn.commit()
-        logger.info("Crawler tables initialized successfully")
+        logger.info("Database tables initialized")
     except Exception as e:
-        logger.error(f"Error initializing crawler tables: {e}")
-        raise
+        logger.error(f"Database initialization error: {e}")
     finally:
         cur.close()
         release_pg_connection(conn)
-
-def token_required(f):
-    """Decorator to require JWT token."""
-    @wraps(f)
-    def decorated(*args, **kwargs):
-        token = request.headers.get('Authorization')
-        if not token:
-            return jsonify({'message': 'Access token required'}), 401
-        try:
-            token = token.split(' ')[1] if token.startswith('Bearer ') else token
-            if token in blacklisted_tokens:
-                return jsonify({'message': 'Token has been revoked'}), 401
-            data = jwt.decode(token, app.config['JWT_SECRET_KEY'], algorithms=['HS256'])
-            conn = get_pg_connection()
-            try:
-                cur = conn.cursor(cursor_factory=extras.NamedTupleCursor)
-                cur.execute("SELECT id, username, email, privilege_level FROM users WHERE id = %s", (data['user_id'],))
-                current_user = cur.fetchone()
-                cur.close()
-                if not current_user:
-                    return jsonify({'message': 'User not found'}), 401
-            finally:
-                release_pg_connection(conn)
-        except jwt.ExpiredSignatureError:
-            return jsonify({'message': 'Token has expired'}), 401
-        except jwt.InvalidTokenError:
-            return jsonify({'message': 'Token is invalid'}), 401
-        except Exception as e:
-            logger.error(f"Token verification error: {e}")
-            return jsonify({'message': 'Token verification failed'}), 401
-        return f(current_user, *args, **kwargs)
-    return decorated
 
 def godmode_required(f):
-    """Decorator to require godmode privileges."""
+    """Decorator to require godmode JWT token."""
     @wraps(f)
-    @token_required
-    def decorated(current_user, *args, **kwargs):
-        if current_user.privilege_level != 'godmode':
-            return jsonify({'message': 'Godmode privileges required'}), 403
-        return f(current_user, *args, **kwargs)
-    return decorated
+    def decorated_function(*args, **kwargs):
+        auth_header = request.headers.get('Authorization')
+        if not auth_header:
+            logger.warning("Authorization header missing")
+            return jsonify({'error': 'Authorization header required'}), 401
+        try:
+            token_type, token = auth_header.split()
+            if token_type.lower() != 'bearer':
+                logger.warning("Invalid token type")
+                return jsonify({'error': 'Bearer token required'}), 401
+            payload = jwt.decode(token, JWT_SECRET, algorithms=['HS256'])
+            if not payload.get('godmode'):
+                logger.warning("Godmode access required")
+                return jsonify({'error': 'Godmode access required'}), 403
+            return f(payload, *args, **kwargs)
+        except jwt.InvalidTokenError as e:
+            logger.error(f"Invalid JWT token: {e}")
+            return jsonify({'error': 'Invalid token'}), 401
+        except Exception as e:
+            logger.error(f"Authentication error: {e}")
+            return jsonify({'error': str(e)}), 500
+    return decorated_function
 
-@app.errorhandler(404)
-def not_found(error):
-    return jsonify({'message': 'Endpoint not found'}), 404
+def deduplicate_urls():
+    """Remove duplicate URLs from crawl_queue."""
+    global last_dedupe_time
+    while True:
+        if dedupe_enabled and (time.time() - last_dedupe_time) >= dedupe_interval:
+            conn = get_pg_connection()
+            try:
+                cur = conn.cursor()
+                cur.execute("""
+                    WITH duplicates AS (
+                        SELECT id, url, ROW_NUMBER() OVER (PARTITION BY url ORDER BY id) AS rn
+                        FROM crawl_queue
+                        WHERE status = 'pending'
+                    )
+                    DELETE FROM crawl_queue
+                    WHERE id IN (SELECT id FROM duplicates WHERE rn > 1)
+                """)
+                deleted_count = cur.rowcount
+                if deleted_count > 0:
+                    logger.info(f"Deduplicated {deleted_count} URLs")
+                conn.commit()
+                last_dedupe_time = time.time()
+            except Exception as e:
+                logger.error(f"Deduplication error: {e}")
+            finally:
+                cur.close()
+                release_pg_connection(conn)
+        time.sleep(60)
 
-@app.errorhandler(500)
-def internal_error(error):
-    logger.error(f"Internal server error: {error}")
-    logger.error(f"Traceback: {traceback.format_exc()}")
-    return jsonify({'message': 'Internal server error'}), 500
-
-@app.route('/api/health', methods=['GET'])
-def health_check():
-    """Health check endpoint."""
-    conn = get_pg_connection()
-    try:
-        cur = conn.cursor()
-        cur.execute("SELECT 1")
-        cur.close()
-        return jsonify({
-            'status': 'healthy',
-            'message': 'Crawler API is running and database is accessible',
-            'timestamp': datetime.datetime.utcnow().isoformat()
-        }), 200
-    except Exception as e:
-        logger.error(f"Health check failed: {e}")
-        return jsonify({
-            'status': f'Database connection failed: {str(e)}',
-            'timestamp': datetime.datetime.utcnow().isoformat()
-        }), 500
-    finally:
-        release_pg_connection(conn)
-
-@app.route('/api/crawler/urls', methods=['GET', 'OPTIONS'])
-def get_urls_to_crawl():
-    """Get URLs for worker nodes to crawl."""
+@app.route('/api/crawler/status', methods=['GET', 'OPTIONS'])
+@godmode_required
+def get_status(current_user):
+    """Get crawler status."""
     if request.method == 'OPTIONS':
         return '', 200
     conn = get_pg_connection()
     try:
         cur = conn.cursor()
-        cur.execute("""
-            SELECT url FROM crawl_queue 
-            WHERE status = 'pending' 
-            ORDER BY added_at ASC 
-            LIMIT 10
-        """)
-        urls = [row[0] for row in cur.fetchall()]
-        if urls:
+        cur.execute("SELECT COUNT(*) FROM crawl_queue WHERE status = 'pending'")
+        pending_urls = cur.fetchone()[0]
+        cur.execute("SELECT COUNT(*) FROM crawl_queue WHERE status = 'processing'")
+        processing_urls = cur.fetchone()[0]
+        cur.execute("SELECT COUNT(*) FROM crawl_queue WHERE status = 'completed'")
+        crawled_urls = cur.fetchone()[0]
+        logger.info(f"Status: {pending_urls} pending, {processing_urls} processing, {crawled_urls} crawled")
+        return jsonify({
+            'pending_urls': pending_urls,
+            'processing_urls': processing_urls,
+            'crawled_urls': crawled_urls,
+            'current_domain': current_domain
+        }), 200
+    except Exception as e:
+        logger.error(f"Error fetching status: {e}")
+        return jsonify({'error': str(e)}), 500
+    finally:
+        cur.close()
+        release_pg_connection(conn)
+
+@app.route('/api/crawler/config', methods=['POST', 'OPTIONS'])
+@godmode_required
+def update_config(current_user):
+    """Update crawler configuration."""
+    if request.method == 'OPTIONS':
+        return '', 200
+    global dedupe_enabled, dedupe_interval
+    data = request.get_json()
+    dedupe_enabled = data.get('dedupe_enabled', dedupe_enabled)
+    dedupe_interval = data.get('dedupe_interval', dedupe_interval)
+    logger.info(f"Updated config: dedupe_enabled={dedupe_enabled}, dedupe_interval={dedupe_interval}")
+    return jsonify({'message': 'Configuration updated'}), 200
+
+@app.route('/api/crawler/urls', methods=['GET', 'POST', 'OPTIONS'])
+@godmode_required
+def manage_urls(current_user):
+    """Fetch URLs to crawl or reset the queue."""
+    global current_domain  # Declare global at the start
+    if request.method == 'OPTIONS':
+        return '', 200
+    conn = get_pg_connection()
+    try:
+        cur = conn.cursor(cursor_factory=RealDictCursor)
+        if request.method == 'POST' and request.get_json().get('reset'):
+            current_domain = None
+            cur.execute("UPDATE crawl_queue SET status = 'pending' WHERE status = 'processing'")
+            cur.execute("DELETE FROM crawl_queue WHERE status = 'completed'")
+            conn.commit()
+            logger.info("Reset crawl queue")
+            return jsonify({'message': 'Queue reset'}), 200
+        else:
+            blacklist_patterns = [f'%://{domain}%' for domain in blacklisted_domains]
+            query = """
+                SELECT url 
+                FROM crawl_queue 
+                WHERE status = 'pending'
+            """
+            if blacklist_patterns:
+                query += " AND url NOT LIKE ALL (%s)"
+                cur.execute(query, (blacklist_patterns,))
+            else:
+                cur.execute(query)
+            urls = [row['url'] for row in cur.fetchall()]
+            if not urls:
+                logger.info("No pending URLs available")
+                return jsonify({'urls': []}), 200
+            domain = urlparse(urls[0]).netloc
+            current_domain = domain
+            filtered_urls = [url for url in urls if urlparse(url).netloc == domain]
             cur.execute("""
                 UPDATE crawl_queue 
                 SET status = 'processing' 
-                WHERE url IN %s
-            """, (tuple(urls),))
-        else:
-            logger.warning("No pending URLs; attempting to reseed")
-            try:
-                with open('seeds.txt', 'r') as f:
-                    seed_urls = [url.strip() for url in f.readlines() if url.strip()]
-                for url in seed_urls:
-                    cur.execute("""
-                        INSERT INTO crawl_queue (url)
-                        VALUES (%s)
-                        ON CONFLICT (url) DO NOTHING
-                    """, (url,))
-                conn.commit()
-                cur.execute("""
-                    SELECT url FROM crawl_queue 
-                    WHERE status = 'pending' 
-                    ORDER BY added_at ASC 
-                    LIMIT 10
-                """)
-                urls = [row[0] for row in cur.fetchall()]
-                if urls:
-                    cur.execute("""
-                        UPDATE crawl_queue 
-                        SET status = 'processing' 
-                        WHERE url IN %s
-                    """, (tuple(urls),))
-            except FileNotFoundError:
-                logger.error("seeds.txt not found during reseed")
-        conn.commit()
-        logger.info(f"Returning {len(urls)} URLs to crawl")
-        return jsonify({'urls': urls}), 200
+                WHERE url = ANY(%s)
+            """, (filtered_urls,))
+            conn.commit()
+            logger.info(f"Returning {len(filtered_urls)} URLs for domain {domain}")
+            return jsonify({'urls': filtered_urls}), 200
     except Exception as e:
-        logger.error(f"Error fetching URLs: {e}")
+        logger.error(f"Error managing URLs: {e}")
         return jsonify({'error': str(e)}), 500
     finally:
         cur.close()
@@ -297,22 +249,27 @@ def submit_crawl_data():
         title = data.get('title')
         summary = data.get('summary')
         tags = data.get('tags')
+        domain = urlparse(url).netloc
         new_urls = data.get('new_urls', [])
         tag_count = len(tags.split(',')) if tags else 0
         if tag_count < 20:
             logger.error(f"URL {url} has only {tag_count} tags; rejecting")
             return jsonify({'message': f'Insufficient tags ({tag_count} < 20)'}), 400
+        if domain in blacklisted_domains:
+            logger.info(f"Rejected submission for {url}; domain {domain} is blacklisted")
+            return jsonify({'message': f'Domain {domain} is blacklisted'}), 400
         cur = conn.cursor()
         cur.execute("""
-            INSERT INTO webpages (url, title, summary, tags)
-            VALUES (%s, %s, %s, %s)
+            INSERT INTO webpages (url, title, summary, tags, domain)
+            VALUES (%s, %s, %s, %s, %s)
             ON CONFLICT (url) DO UPDATE 
             SET title = EXCLUDED.title,
                 summary = EXCLUDED.summary,
                 tags = EXCLUDED.tags,
-                timestamp = CURRENT_TIMESTAMP
+                timestamp = CURRENT_TIMESTAMP,
+                domain = EXCLUDED.domain
             RETURNING id
-        """, (url, title, summary, tags))
+        """, (url, title, summary, tags, domain))
         webpage_id = cur.fetchone()[0]
         logger.info(f"{'Updated' if cur.rowcount else 'Inserted'} webpage record for {url} (id: {webpage_id})")
         cur.execute("""
@@ -322,11 +279,20 @@ def submit_crawl_data():
             WHERE url = %s
         """, (url,))
         for new_url in new_urls:
-            cur.execute("""
-                INSERT INTO crawl_queue (url)
-                VALUES (%s)
-                ON CONFLICT (url) DO NOTHING
-            """, (new_url,))
+            new_domain = urlparse(new_url).netloc
+            if new_domain not in blacklisted_domains:
+                cur.execute("""
+                    INSERT INTO crawl_queue (url)
+                    VALUES (%s)
+                    ON CONFLICT (url) DO NOTHING
+                """, (new_url,))
+                cur.execute("""
+                    INSERT INTO webpages (url, domain)
+                    VALUES (%s, %s)
+                    ON CONFLICT (url) DO NOTHING
+                """, (new_url, new_domain))
+            else:
+                logger.info(f"Skipped adding {new_url} to crawl_queue; domain {new_domain} is blacklisted")
         conn.commit()
         logger.info(f"Processed {url} with {len(new_urls)} new URLs")
         return jsonify({'message': 'Data saved successfully'}), 200
@@ -338,97 +304,142 @@ def submit_crawl_data():
             cur.close()
         release_pg_connection(conn)
 
-@app.route('/api/crawler/status', methods=['GET', 'OPTIONS'])
-def get_crawler_status():
-    """Get current crawler status and statistics."""
-    if request.method == 'OPTIONS':
-        return '', 200
-    conn = get_pg_connection()
-    try:
-        cur = conn.cursor()
-        cur.execute("SELECT COUNT(*) FROM crawl_queue WHERE status = 'pending'")
-        pending = cur.fetchone()[0]
-        cur.execute("SELECT COUNT(*) FROM crawl_queue WHERE status = 'processing'")
-        processing = cur.fetchone()[0]
-        cur.execute("SELECT COUNT(*) FROM webpages")
-        crawled = cur.fetchone()[0]
-        cur.close()
-        return jsonify({
-            'pending_urls': pending,
-            'processing_urls': processing,
-            'crawled_urls': crawled,
-            'timestamp': datetime.datetime.utcnow().isoformat()
-        }), 200
-    except Exception as e:
-        logger.error(f"Error getting crawler status: {e}")
-        return jsonify({'error': str(e)}), 500
-    finally:
-        release_pg_connection(conn)
-
-@app.route('/api/crawler/resume', methods=['POST', 'OPTIONS'])
+@app.route('/api/crawler/skip_domain', methods=['POST', 'OPTIONS'])
 @godmode_required
-def resume_crawler(current_user):
-    """Resume crawling from last 10 URLs."""
+def skip_domain(current_user):
+    """Skip the current domain being crawled."""
     if request.method == 'OPTIONS':
         return '', 200
+    global current_domain
+    if not current_domain:
+        logger.info("No current domain to skip")
+        return jsonify({'message': 'No current domain'}), 400
     conn = get_pg_connection()
     try:
         cur = conn.cursor()
         cur.execute("""
-            SELECT url FROM webpages 
-            ORDER BY timestamp DESC 
-            LIMIT 10
-        """)
-        recent_urls = [row[0] for row in cur.fetchall()]
-        for url in recent_urls:
-            cur.execute("""
-                INSERT INTO crawl_queue (url)
-                VALUES (%s)
-                ON CONFLICT (url) DO NOTHING
-            """, (url,))
+            UPDATE crawl_queue 
+            SET status = 'completed' 
+            WHERE url LIKE %s AND status = 'processing'
+        """, (f'%://{current_domain}%',))
+        skipped_count = cur.rowcount
         conn.commit()
-        logger.info(f"Crawler resumed with {len(recent_urls)} URLs")
-        return jsonify({'message': 'Crawler resumed with last 10 URLs', 'urls': recent_urls}), 200
+        logger.info(f"Skipped {skipped_count} URLs for domain {current_domain}")
+        current_domain = None
+        return jsonify({'message': f'Skipped domain {current_domain}'}), 200
     except Exception as e:
-        logger.error(f"Error resuming crawler: {e}")
+        logger.error(f"Error skipping domain {current_domain}: {e}")
         return jsonify({'error': str(e)}), 500
     finally:
         cur.close()
         release_pg_connection(conn)
 
-@app.route('/api/crawler/reset', methods=['POST', 'OPTIONS'])
+@app.route('/api/crawler/blacklist', methods=['GET', 'OPTIONS'])
 @godmode_required
-def reset_crawler(current_user):
-    """Reset crawler with seed URLs."""
+def get_blacklist(current_user):
+    """Get the list of blacklisted domains."""
     if request.method == 'OPTIONS':
         return '', 200
+    logger.info("Returning blacklisted domains")
+    return jsonify({'domains': list(blacklisted_domains)}), 200
+
+@app.route('/api/crawler/blacklist_domain', methods=['GET', 'POST', 'OPTIONS'])
+@godmode_required
+def blacklist_domain(current_user):
+    """Add a domain to the blacklist or check if a domain is blacklisted."""
+    if request.method == 'OPTIONS':
+        return '', 200
+    if request.method == 'GET':
+        domain = request.args.get('domain')
+        if not domain:
+            logger.warning("Domain parameter missing for blacklist check")
+            return jsonify({'message': 'Domain is required'}), 400
+        is_blacklisted = domain in blacklisted_domains
+        logger.info(f"Returning blacklist status for domain: {domain} - {is_blacklisted}")
+        return jsonify({'blacklisted': is_blacklisted}), 200
+    data = request.get_json()
+    domain = data.get('domain')
+    if not domain:
+        logger.warning("Domain is required for blacklisting")
+        return jsonify({'message': 'Domain is required'}), 400
+    conn = get_pg_connection()
+    try:
+        blacklisted_domains.add(domain)
+        cur = conn.cursor()
+        cur.execute("""
+            UPDATE crawl_queue 
+            SET status = 'blacklisted' 
+            WHERE url LIKE %s
+        """, (f'%://{domain}%',))
+        updated_rows = cur.rowcount
+        cur.execute("""
+            DELETE FROM crawl_queue 
+            WHERE url LIKE %s
+        """, (f'%://{domain}%',))
+        deleted_rows = cur.rowcount
+        cur.execute("""
+            DELETE FROM webpages 
+            WHERE domain = %s
+        """, (domain,))
+        deleted_webpages = cur.rowcount
+        conn.commit()
+        logger.info(f"Blacklisted domain {domain}: marked {updated_rows} URLs, deleted {deleted_rows} from crawl_queue, {deleted_webpages} from webpages")
+        return jsonify({'message': f'Domain {domain} blacklisted'}), 200
+    except Exception as e:
+        logger.error(f"Error blacklisting domain {domain}: {e}")
+        return jsonify({'error': str(e)}), 500
+    finally:
+        cur.close()
+        release_pg_connection(conn)
+
+@app.route('/api/crawler/unblacklist_domain', methods=['POST', 'OPTIONS'])
+@godmode_required
+def unblacklist_domain(current_user):
+    """Remove a domain from the blacklist."""
+    if request.method == 'OPTIONS':
+        return '', 200
+    data = request.get_json()
+    domain = data.get('domain')
+    if not domain:
+        logger.warning("Domain is required for unblacklisting")
+        return jsonify({'message': 'Domain is required'}), 400
+    if domain in blacklisted_domains:
+        blacklisted_domains.remove(domain)
+        logger.info(f"Unblacklisted domain {domain}")
+        return jsonify({'message': f'Domain {domain} unblacklisted'}), 200
+    logger.info(f"Domain {domain} not in blacklist")
+    return jsonify({'message': f'Domain {domain} not in blacklist'}), 200
+
+@app.route('/api/crawler/clear_blacklisted_urls', methods=['POST', 'OPTIONS'])
+@godmode_required
+def clear_blacklisted_urls(current_user):
+    """Clear URLs for a blacklisted domain from crawl_queue."""
+    if request.method == 'OPTIONS':
+        return '', 200
+    data = request.get_json()
+    domain = data.get('domain')
+    if not domain:
+        logger.warning("Domain is required for clearing blacklisted URLs")
+        return jsonify({'message': 'Domain is required'}), 400
     conn = get_pg_connection()
     try:
         cur = conn.cursor()
-        cur.execute("DELETE FROM crawl_queue")
-        try:
-            with open('seeds.txt', 'r') as f:
-                seed_urls = [url.strip() for url in f.readlines() if url.strip()]
-        except FileNotFoundError:
-            cur.close()
-            return jsonify({'error': 'seeds.txt not found'}), 400
-        for url in seed_urls:
-            cur.execute("""
-                INSERT INTO crawl_queue (url)
-                VALUES (%s)
-                ON CONFLICT (url) DO NOTHING
-            """, (url,))
+        cur.execute("""
+            DELETE FROM crawl_queue 
+            WHERE url LIKE %s
+        """, (f'%://{domain}%',))
+        deleted_rows = cur.rowcount
         conn.commit()
-        logger.info("Crawler reset with seed URLs")
-        return jsonify({'message': 'Crawler reset with seed URLs'}), 200
+        logger.info(f"Deleted {deleted_rows} URLs for domain {domain} from crawl_queue")
+        return jsonify({'message': f'Cleared {deleted_rows} URLs for domain {domain}'}), 200
     except Exception as e:
-        logger.error(f"Error resetting crawler: {e}")
+        logger.error(f"Error clearing blacklisted URLs for {domain}: {e}")
         return jsonify({'error': str(e)}), 500
     finally:
         cur.close()
         release_pg_connection(conn)
 
 if __name__ == '__main__':
-    init_crawler_tables()
-    deduplicate_database()
-    app.run(host='0.0.0.0', port=5001, debug=False)
+    init_db()
+    threading.Thread(target=deduplicate_urls, daemon=True).start()
+    app.run(host='0.0.0.0', port=5001, threaded=True)

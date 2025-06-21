@@ -9,3 +9,4 @@ pyjwt
 nltk
 psutil
 tkinter
+pg

@@ -1,0 +1,4 @@
+{
+  "api_base_url": "http://crawler.projectkryptos.xyz/api/crawler",
+  "jwt_token": "eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzI1NiJ9.eyJnb2Rtb2RlIjp0cnVlLCJpYXQiOjE3NTA0NzA5MTIsImV4cCI6MTc1MDU1NzMxMn0.TBpP4K3d3ku5fTNPd6H1RJO357F1tTflrX0RIZ2ftYU"
+}
